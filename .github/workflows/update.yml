@@ -1,0 +1,62 @@
+name: "myTCAS ViewTracker Auto Sync"
+
+on:
+  schedule:
+    # 06:00 AM ICT (UTC+7) -> 23:00 UTC
+    - cron: "0 23 * * *"
+    # 18:00 PM ICT (UTC+7) -> 11:00 UTC
+    - cron: "0 11 * * *"
+  workflow_dispatch: # ปุ่มสำหรับกดรันเทสต์ด้วยตนเองจาก GitHub Console
+
+concurrency:
+  group: scraper-sync
+  cancel-in-progress: true
+
+jobs:
+  scrape-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90 # เผื่อกรณีสเกลข้อมูลใหญ่ขึ้น
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install aiohttp beautifulsoup4
+
+      - name: Execute Scraper Pipeline
+        run: |
+          python scraper.py
+
+      - name: Validate Output File
+        run: |
+          if [ ! -s data.json ]; then
+            echo "Error: data.json is missing or empty!"
+            exit 1
+          fi
+          echo "Data validation passed. File size: $(ls -lh data.json | awk '{print $5}')"
+
+      - name: Commit and Push Changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action Bot"
+          git add data.json master_catalog.json
+          
+          # ตรวจสอบว่ามีการเปลี่ยนแปลงจริงหรือไม่
+          if git diff --staged --quiet; then
+            echo "No data changes detected. Skipping commit."
+          else
+            TIMESTAMP=$(TZ='Asia/Bangkok' date '+%Y-%m-%d %H:%M:%S')
+            git commit -m "Auto-update TCAS views: ${TIMESTAMP} ICT [skip ci]"
+            git push
+          fi
