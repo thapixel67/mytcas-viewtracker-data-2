@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-myTCAS ViewTracker - Production Pipeline (Built-in html.parser)
+myTCAS ViewTracker - Production Pipeline (Universal Key Mapping & Deep Header Spoofing)
 """
 
 import asyncio
@@ -29,7 +29,7 @@ logger.addHandler(handler)
 logger.propagate = False
 
 BASE_URL = "https://course.mytcas.com"
-MAX_CONCURRENT_REQUESTS = 35
+MAX_CONCURRENT_REQUESTS = 30
 REQUEST_TIMEOUT_SEC = 15
 SOCK_READ_TIMEOUT = 10
 OUTPUT_FILE = Path("data.json")
@@ -38,25 +38,32 @@ SPLIT_DIR = Path("data/universities")
 S3_COURSES_URL = "https://my-tcas.s3.ap-southeast-1.amazonaws.com/mytcas/courses.json"
 S3_UNIVERSITIES_URL = "https://my-tcas.s3.ap-southeast-1.amazonaws.com/mytcas/universities.json"
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-]
-
 VIEW_COUNT_PATTERNS = [
     re.compile(r"ยอดผู้เข้าชม\s*[:\-]?\s*([0-9,]+)\s*ครั้ง", re.IGNORECASE),
     re.compile(r"ผู้เข้าชม\s*[:\-]?\s*([0-9,]+)\s*ครั้ง", re.IGNORECASE),
+    re.compile(r"ยอดผู้เข้าชม\s*([0-9,]+)", re.IGNORECASE),
     re.compile(r'"(?:views|view_count|viewCount|viewsCount|hits|pageviews|total_views)"\s*:\s*([0-9]+)', re.IGNORECASE),
+    re.compile(r'([0-9,]+)\s*ครั้ง', re.IGNORECASE),
 ]
 
-def get_headers() -> Dict[str, str]:
+def get_browser_headers() -> Dict[str, str]:
+    """สร้าง Headers จำลอง Google Chrome ตัวจริงบน Windows เพื่อหลบ Cloudflare WAF"""
     return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
-        "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://course.mytcas.com/",
+        "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
         "Connection": "keep-alive",
+        "Cache-Control": "max-age=0",
     }
 
 def classify_faculty_group(faculty: str, program_name: str) -> str:
@@ -97,19 +104,19 @@ def extract_val(d: Dict, *keys: str) -> str:
 async def fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[Any]:
     timeout = aiohttp.ClientTimeout(total=25, sock_read=15)
     try:
-        async with session.get(url, headers=get_headers(), timeout=timeout) as response:
+        async with session.get(url, headers=get_browser_headers(), timeout=timeout) as response:
             if response.status == 200:
                 return await response.json(content_type=None)
     except Exception as e:
         logger.warning(f"ดึง JSON จาก {url} ไม่สำเร็จ: {e}")
     return None
 
-async def fetch_html(session: aiohttp.ClientSession, url: str, semaphore: asyncio.Semaphore) -> Optional[str]:
+async def fetch_program_html(session: aiohttp.ClientSession, url: str, semaphore: asyncio.Semaphore) -> Optional[str]:
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SEC, sock_read=SOCK_READ_TIMEOUT)
     async with semaphore:
-        await asyncio.sleep(random.uniform(0.02, 0.06))
+        await asyncio.sleep(random.uniform(0.04, 0.10))
         try:
-            async with session.get(url, headers=get_headers(), timeout=timeout) as response:
+            async with session.get(url, headers=get_browser_headers(), timeout=timeout, allow_redirects=True) as response:
                 if response.status == 200:
                     return await response.text(errors="replace")
         except Exception:
@@ -117,11 +124,13 @@ async def fetch_html(session: aiohttp.ClientSession, url: str, semaphore: asynci
     return None
 
 def parse_program_data(pid: str, html: Optional[str], raw: Dict, uni_map: Dict[str, str]) -> Dict[str, Any]:
+    # ดึงรหัสสถาบันและชื่อมหาวิทยาลัย
     u_id = extract_val(raw, "u_id", "university_id") or pid[:3]
     university = extract_val(raw, "u_name", "university_name") or uni_map.get(u_id, "ไม่ระบุสถาบัน")
     faculty = extract_val(raw, "faculty_name", "faculty_name_th", "faculty") or "ไม่ระบุคณะ"
-    program_name = extract_val(raw, "program_name", "program_name_th", "name_th", "major_name", "field_name")
     
+    # ดึงชื่อสาขาวิชาจากทุกคีย์ที่เป็นไปได้ใน S3
+    program_name = extract_val(raw, "name", "name_th", "program_name", "program_name_th", "major_name", "field_name", "title")
     if not program_name or "ระบบการคัดเลือก" in program_name:
         program_name = f"สาขาวิชา ({pid})"
 
@@ -136,6 +145,9 @@ def parse_program_data(pid: str, html: Optional[str], raw: Dict, uni_map: Dict[s
     r2 = parse_seat("r2") or parse_seat("round2")
     r3 = parse_seat("r3") or parse_seat("round3")
     r4 = parse_seat("r4") or parse_seat("round4")
+    total_seats = r1 + r2 + r3 + r4
+    if total_seats == 0:
+        total_seats = parse_seat("total_seats") or parse_seat("seats") or parse_seat("quota")
 
     views = 0
     if html:
@@ -158,25 +170,56 @@ def parse_program_data(pid: str, html: Optional[str], raw: Dict, uni_map: Dict[s
                         break
 
     if views == 0:
-        meta_views = extract_val(raw, "views", "view_count", "hits")
+        meta_views = extract_val(raw, "views", "view_count", "hits", "pageviews")
         if meta_views.isdigit():
             views = int(meta_views)
 
+    category = classify_faculty_group(faculty, program_name)
+    campus = extract_val(raw, "campus_name", "campus") or "วิทยาเขตหลัก"
+    program_type = extract_val(raw, "program_type") or "ภาษาไทย ปกติ"
+
+    # บันทึกแบบ Universal Key Mapping (รองรับทั้ง index.html เดิมและ index.html ใหม่)
     return {
+        # ID Keys
+        "id": pid,
         "program_id": pid,
+        "code": pid,
+        "program_code": pid,
+
+        # Name Keys
+        "name": program_name,
         "program_name": program_name,
+        "title": program_name,
+        "major_name": program_name,
+
+        # Institution Keys
         "faculty": faculty,
+        "faculty_name": faculty,
         "university": university,
+        "university_name": university,
+        "u_name": university,
         "university_id": u_id,
-        "campus": extract_val(raw, "campus_name", "campus") or "วิทยาเขตหลัก",
-        "program_type": extract_val(raw, "program_type") or "ภาษาไทย ปกติ",
-        "category": classify_faculty_group(faculty, program_name),
+
+        # Seat / Quota Keys
+        "total_seats": total_seats,
+        "seats": total_seats,
+        "quota": total_seats,
         "r1": r1,
         "r2": r2,
         "r3": r3,
         "r4": r4,
-        "total_seats": r1 + r2 + r3 + r4,
+
+        # Metric Keys
         "views": views,
+        "view_count": views,
+        "viewCount": views,
+        "hits": views,
+        "views_diff": 0,
+
+        # Meta
+        "category": category,
+        "campus": campus,
+        "program_type": program_type,
         "url": f"{BASE_URL}/programs/{pid}",
     }
 
@@ -206,7 +249,7 @@ async def main() -> None:
 
         catalog = {}
         for item in courses_json:
-            pid = extract_val(item, "program_id", "id", "code")
+            pid = extract_val(item, "id", "program_id", "code")
             if len(pid) >= 8:
                 catalog[pid] = item
                 uid = extract_val(item, "u_id", "university_id")
@@ -215,18 +258,30 @@ async def main() -> None:
                     uni_map[uid] = uname
 
         total = len(catalog)
+        pids = list(catalog.keys())
         logger.info(f"✅ โหลดสำเร็จ: มหาวิทยาลัย {len(uni_map)} แห่ง | หลักสูตรทั้งหมด {total:,} สาขา")
+
+        # Probe Check: ทดสอบยิง 1 หน้าเพื่อดูสถานะ HTTP และการตอบกลับของเซิร์ฟเวอร์ myTCAS
+        sample_pid = pids[0]
+        sample_url = f"{BASE_URL}/programs/{sample_pid}"
+        try:
+            async with session.get(sample_url, headers=get_browser_headers(), timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                sample_text = await resp.text()
+                logger.info(f"📡 [Probe Check] ยิงทดสอบ {sample_url} -> Status: HTTP {resp.status} (ขนาด {len(sample_text):,} ตัวอักษร)")
+                if resp.status != 200:
+                    logger.warning(f"⚠️ เซิร์ฟเวอร์ส่งรหัส {resp.status}: {sample_text[:180]}")
+        except Exception as e:
+            logger.warning(f"⚠️ Probe Exception: {e}")
 
         logger.info(f"🚀 [Stage 2] กำลังประมวลผลข้อมูลและดึงยอดวิว...")
         start_ts = time.time()
-        pids = list(catalog.keys())
         results = []
-        batch_size = 400
+        batch_size = 350
 
         for idx in range(0, total, batch_size):
             batch = pids[idx : idx + batch_size]
             async def process_one(pid):
-                html = await fetch_html(session, f"{BASE_URL}/programs/{pid}", semaphore)
+                html = await fetch_program_html(session, f"{BASE_URL}/programs/{pid}", semaphore)
                 return parse_program_data(pid, html, catalog[pid], uni_map)
 
             batch_res = await asyncio.gather(*(process_one(p) for p in batch))
@@ -242,15 +297,28 @@ async def main() -> None:
         for i, item in enumerate(results, 1):
             item["rank"] = i
 
+        now_th = datetime.now(TZ_TH)
+        now_str = now_th.strftime("%Y-%m-%d %H:%M:%S")
+
         payload = {
+            # Meta ที่เข้ากันได้กับทุกแบบฟอร์มของ index.html
+            "updated_at": now_str,
+            "last_updated": now_str,
+            "updatedAt": now_str,
+            "timestamp": now_str,
             "metadata": {
-                "updated_at": datetime.now(TZ_TH).strftime("%Y-%m-%d %H:%M:%S"),
+                "updated_at": now_str,
+                "last_updated": now_str,
+                "updatedAt": now_str,
+                "timestamp": now_str,
                 "total_programs": len(results),
                 "total_universities": len({p["university"] for p in results if p["university"] != "ไม่ระบุสถาบัน"}),
                 "total_views": sum(p["views"] for p in results),
                 "total_seats": sum(p["total_seats"] for p in results),
             },
             "programs": results,
+            "data": results,
+            "courses": results,
         }
 
         with OUTPUT_FILE.open("w", encoding="utf-8") as f:
