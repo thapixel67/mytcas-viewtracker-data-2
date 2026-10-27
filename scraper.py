@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-myTCAS ViewTracker - Production Pipeline (Direct S3 Catalog + Safe Metric Scraper)
+myTCAS ViewTracker - Production Pipeline (Built-in html.parser)
 """
 
 import asyncio
@@ -35,7 +35,6 @@ SOCK_READ_TIMEOUT = 10
 OUTPUT_FILE = Path("data.json")
 SPLIT_DIR = Path("data/universities")
 
-# แหล่งข้อมูล S3 หลักของ myTCAS (เปิดสาธารณะและมีความเสถียรสูงสุด)
 S3_COURSES_URL = "https://my-tcas.s3.ap-southeast-1.amazonaws.com/mytcas/courses.json"
 S3_UNIVERSITIES_URL = "https://my-tcas.s3.ap-southeast-1.amazonaws.com/mytcas/universities.json"
 
@@ -149,7 +148,7 @@ def parse_program_data(pid: str, html: Optional[str], raw: Dict, uni_map: Dict[s
                     break
 
         if views == 0:
-            soup = BeautifulSoup(html, "lxml")
+            soup = BeautifulSoup(html, "html.parser")
             tag = soup.find("script", id="__NEXT_DATA__")
             if tag and tag.string:
                 for p in VIEW_COUNT_PATTERNS:
