@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-myTCAS ViewTracker - Production Pipeline (Fixed Brotli Encoding + Smart Metrics Engine)
+myTCAS ViewTracker - 100% Real Data Scraper & JS Bundle Endpoint Extractor
 """
 
 import asyncio
-import hashlib
 import json
 import logging
-import random
 import re
 import sys
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
+from urllib.parse import urljoin
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -29,32 +28,27 @@ logger.addHandler(handler)
 logger.propagate = False
 
 BASE_URL = "https://course.mytcas.com"
-MAX_CONCURRENT_REQUESTS = 35
+S3_BASE_URL = "https://my-tcas.s3.ap-southeast-1.amazonaws.com/mytcas"
+S3_COURSES_URL = f"{S3_BASE_URL}/courses.json"
+S3_UNIVERSITIES_URL = f"{S3_BASE_URL}/universities.json"
+
+MAX_CONCURRENT_REQUESTS = 40
 REQUEST_TIMEOUT_SEC = 15
 SOCK_READ_TIMEOUT = 10
 OUTPUT_FILE = Path("data.json")
 SPLIT_DIR = Path("data/universities")
 
-# หากเว็บ myTCAS ปิดซ่อน API ยอดวิวหลังบ้าน (ได้ค่า 0 ทั้งระบบ) ให้คำนวณดัชนียอดเข้าชมสะสมอัตโนมัติ
-ENABLE_SMART_ESTIMATION = True
+# รหัสสาขาเภสัชกรรมอุตสาหการ จุฬาฯ สำหรับใช้ตรวจสอบความถูกต้องกับหน้าเว็บจริง (รับ 50+12=62 คน, ยอดวิว ~23,865)
+TEST_PROGRAM_ID = "10010133130201A"
 
-S3_COURSES_URL = "https://my-tcas.s3.ap-southeast-1.amazonaws.com/mytcas/courses.json"
-S3_UNIVERSITIES_URL = "https://my-tcas.s3.ap-southeast-1.amazonaws.com/mytcas/universities.json"
-
-VIEW_COUNT_PATTERNS = [
-    re.compile(r"ยอดผู้เข้าชม\s*[:\-]?\s*([0-9,]+)\s*ครั้ง", re.IGNORECASE),
-    re.compile(r"ผู้เข้าชม\s*[:\-]?\s*([0-9,]+)\s*ครั้ง", re.IGNORECASE),
-    re.compile(r'"(?:views|view_count|viewCount|viewsCount|hits|pageviews|total_views)"\s*:\s*([0-9]+)', re.IGNORECASE),
-]
-
-def get_browser_headers() -> Dict[str, str]:
-    """ใช้ gzip, deflate เท่านั้น (ตัด br ออกเพื่อป้องกันปัญหา Brotli Decode Error 400)"""
+def get_headers() -> Dict[str, str]:
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
-        "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept": "application/json,text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8",
         "Accept-Encoding": "gzip, deflate",
         "Referer": "https://course.mytcas.com/",
+        "Origin": "https://course.mytcas.com",
         "Connection": "keep-alive",
     }
 
@@ -93,164 +87,349 @@ def extract_val(d: Dict, *keys: str) -> str:
             return str(v).strip()
     return ""
 
-def compute_smart_metrics(pid: str, category: str, university: str, prev_views: int = 0) -> Dict[str, int]:
-    """
-    คำนวณจำนวนรับและยอดผู้เข้าชมสะสมแบบ Deterministic (อ้างอิงตามรหัสสาขาและระดับความนิยมจริง)
-    ใช้เฉพาะกรณีที่เซิร์ฟเวอร์ myTCAS ไม่เปิดเผยค่า View Count สาธารณะใน S3
-    """
-    h = int(hashlib.md5(pid.encode("utf-8")).hexdigest()[:8], 16)
-
-    # ฐานความนิยมตามกลุ่มคณะ
-    cat_base = {
-        "แพทย์ / ทันตะ / เภสัช / สัตวแพทย์": 38000,
-        "พยาบาล / สหเวช / สุขภาพ": 24000,
-        "วิทยาการคอม / IT / ดิจิทัล": 31000,
-        "บริหารธุรกิจ / บัญชี": 26000,
-        "วิศวกรรมศาสตร์": 22000,
-        "นิติศาสตร์ / รัฐศาสตร์": 23000,
-        "เศรษฐศาสตร์": 19000,
-        "มนุษยศาสตร์ / ศิลปศาสตร์ / ภาษา": 21000,
-        "สถาปัตย์ / ศิลปกรรม / นิเทศศาสตร์": 20000,
-        "ครุศาสตร์ / ศึกษาศาสตร์": 17000,
-        "วิทยาศาสตร์": 14000,
-        "เกษตรศาสตร์ / อุตสาหกรรมเกษตร": 12000,
-    }.get(category, 11500)
-
-    # ตัวคูณตามกลุ่มมหาวิทยาลัยยอดนิยม
-    top_unis = ["จุฬาลงกรณ์", "มหิดล", "ธรรมศาสตร์", "เกษตรศาสตร์", "ขอนแก่น", "เชียงใหม่", "สงขลานครินทร์", "พระจอมเกล้า", "ลาดกระบัง", "ศรีนครินทรวิโรฒ", "ศิลปากร"]
-    uni_mult = 1.45 if any(u in university for u in top_unis) else 0.85
-
-    variation = 0.35 + ((h % 1000) / 1000.0) * 1.15
-    base_views = int(cat_base * uni_mult * variation)
-
-    # หากมีข้อมูลรอบก่อนหน้า ให้บวกยอดวิวเพิ่มตามรอบอัปเดต (15 - 180 วิวต่อรอบ 12 ชม.)
-    increment = 15 + (h % 140)
-    views = (prev_views + increment) if prev_views > 0 else base_views
-
-    # จำนวนรับแต่ละรอบ
-    r1 = 10 + (h % 55)
-    r2 = 10 + ((h >> 3) % 40)
-    r3 = 15 + ((h >> 6) % 75)
-    r4 = ((h >> 9) % 15) if (h % 4 == 0) else 0
-
-    return {
-        "r1": r1,
-        "r2": r2,
-        "r3": r3,
-        "r4": r4,
-        "total_seats": r1 + r2 + r3 + r4,
-        "views": views,
-        "views_diff": increment,
-    }
-
-async def fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[Any]:
-    timeout = aiohttp.ClientTimeout(total=25, sock_read=15)
+async def fetch_json(session: aiohttp.ClientSession, url: str, semaphore: Optional[asyncio.Semaphore] = None) -> Optional[Any]:
+    timeout = aiohttp.ClientTimeout(total=20, sock_read=12)
     try:
-        async with session.get(url, headers=get_browser_headers(), timeout=timeout) as response:
-            if response.status == 200:
-                return await response.json(content_type=None)
-    except Exception as e:
-        logger.warning(f"ดึง JSON จาก {url} ไม่สำเร็จ: {e}")
-    return None
-
-async def fetch_text(session: aiohttp.ClientSession, url: str, semaphore: asyncio.Semaphore) -> Optional[str]:
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SEC, sock_read=SOCK_READ_TIMEOUT)
-    async with semaphore:
-        await asyncio.sleep(random.uniform(0.02, 0.05))
-        try:
-            async with session.get(url, headers=get_browser_headers(), timeout=timeout) as response:
-                if response.status == 200:
-                    return await response.text(errors="replace")
-        except Exception:
-            pass
-    return None
-
-def load_previous_views_map(filepath: Path) -> Dict[str, int]:
-    prev = {}
-    if not filepath.exists():
-        return prev
-    try:
-        with filepath.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        rows = data.get("programs") or data.get("data") or []
-        for r in rows:
-            pid = r.get("program_id") or r.get("id")
-            v = int(r.get("views") or 0)
-            if pid and v > 0:
-                prev[str(pid)] = v
+        if semaphore:
+            async with semaphore:
+                async with session.get(url, headers=get_headers(), timeout=timeout) as resp:
+                    if resp.status == 200:
+                        return await resp.json(content_type=None)
+        else:
+            async with session.get(url, headers=get_headers(), timeout=timeout) as resp:
+                if resp.status == 200:
+                    return await resp.json(content_type=None)
     except Exception:
         pass
-    return prev
+    return None
 
-def parse_program_data(
-    pid: str,
-    html: Optional[str],
-    raw: Dict,
-    uni_map: Dict[str, str],
-    prev_views_map: Dict[str, int],
-) -> Dict[str, Any]:
-    u_id = extract_val(raw, "u_id", "university_id") or pid[:3]
-    university = extract_val(raw, "u_name", "university_name", "university_name_th") or uni_map.get(u_id, "ไม่ระบุสถาบัน")
-    faculty = extract_val(raw, "faculty_name", "faculty_name_th", "faculty") or "ไม่ระบุคณะ"
+async def fetch_text(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    timeout = aiohttp.ClientTimeout(total=15, sock_read=10)
+    try:
+        async with session.get(url, headers=get_headers(), timeout=timeout) as resp:
+            if resp.status == 200:
+                return await resp.text(errors="replace")
+    except Exception:
+        pass
+    return None
 
-    # รวมชื่อหลักสูตรและสาขาวิชาให้ชัดเจน
-    prog_title = extract_val(raw, "program_name_th", "program_name", "name_th", "name")
-    major_title = extract_val(raw, "major_name_th", "major_name", "field_name_th", "field_name")
-    project_title = extract_val(raw, "project_name_th", "project_name")
+async def inspect_spa_bundles(session: aiohttp.ClientSession) -> Dict[str, Any]:
+    """
+    ดาวน์โหลดและแกะไฟล์ JavaScript (.js) ของเว็บ course.mytcas.com
+    เพื่อค้นหา Endpoint จริงที่ใช้ดึง 'ยอดผู้เข้าชม' และข้อมูล 'รอบ 1-4'
+    """
+    logger.info("🔎 [JS Inspector] กำลังแกะไฟล์ JavaScript ของเว็บ course.mytcas.com เพื่อหา API ยอดผู้เข้าชมจริง...")
+    html = await fetch_text(session, f"{BASE_URL}/programs/{TEST_PROGRAM_ID}")
+    discovered_urls: Set[str] = set()
+    discovered_json_names: Set[str] = set()
 
-    if major_title and prog_title and major_title not in prog_title:
-        program_name = f"{prog_title} ({major_title})"
-    else:
-        program_name = prog_title or major_title or project_title or f"สาขาวิชา ({pid})"
+    if not html:
+        logger.warning("⚠️ ไม่สามารถโหลดหน้า SPA Shell ได้")
+        return {"urls": [], "json_names": []}
 
-    def parse_seat(key: str) -> int:
-        val = raw.get(key, 0)
-        try:
-            return int(str(val).replace(",", "").strip() or 0)
-        except ValueError:
-            return 0
+    soup = BeautifulSoup(html, "html.parser")
+    script_urls: Set[str] = set()
+    for s in soup.find_all("script", src=True):
+        script_urls.add(urljoin(BASE_URL, s["src"]))
+    for link in soup.find_all("link", href=True):
+        if link["href"].endswith(".js"):
+            script_urls.add(urljoin(BASE_URL, link["href"]))
 
-    r1 = parse_seat("r1") or parse_seat("round1") or parse_seat("cnt_1")
-    r2 = parse_seat("r2") or parse_seat("round2") or parse_seat("cnt_2")
-    r3 = parse_seat("r3") or parse_seat("round3") or parse_seat("cnt_3")
-    r4 = parse_seat("r4") or parse_seat("round4") or parse_seat("cnt_4")
+    logger.info(f"📦 พบไฟล์ Script หลักใน HTML จำนวน {len(script_urls)} ไฟล์: {list(script_urls)}")
+
+    # ดาวน์โหลดไฟล์ JS หลัก และค้นหา Chunk ย่อยทั้งหมด
+    all_js_contents: Dict[str, str] = {}
+    chunk_urls: Set[str] = set()
+
+    for s_url in script_urls:
+        js_code = await fetch_text(session, s_url)
+        if js_code:
+            all_js_contents[s_url] = js_code
+            # ค้นหาไฟล์ .js ย่อยที่ถูกอ้างอิงใน Bundle (Vite / Webpack chunks)
+            for m in re.finditer(r'["\']([0-9A-Za-z_/\-\.]+\.js)["\']', js_code):
+                path = m.group(1)
+                if not path.startswith("http"):
+                    if path.startswith("/"):
+                        chunk_urls.add(urljoin(BASE_URL, path))
+                    else:
+                        base_dir = s_url.rsplit("/", 1)[0] + "/"
+                        chunk_urls.add(urljoin(base_dir, path))
+
+    # ดาวน์โหลด Chunk ย่อยเพิ่มเติม (จำกัดสูงสุด 25 ไฟล์)
+    extra_chunks = sorted(chunk_urls - set(all_js_contents.keys()))[:25]
+    if extra_chunks:
+        logger.info(f"📦 กำลังสแกน JS Chunks ย่อยเพิ่มเติม {len(extra_chunks)} ไฟล์...")
+        chunk_texts = await asyncio.gather(*(fetch_text(session, u) for u in extra_chunks))
+        for u, txt in zip(extra_chunks, chunk_texts):
+            if txt:
+                all_js_contents[u] = txt
+
+    # สแกนเนื้อหา JS ทุกไฟล์เพื่อหา URL, ไฟล์ .json และโค้ดส่วนที่แสดงคำว่า "ยอดผู้เข้าชม"
+    view_keywords = ["ยอดผู้เข้าชม", "\\u0e22\\u0e2d\\u0e14\\u0e1c\\u0e39\\u0e49\\u0e40\\u0e02\\u0e49\\u0e32\\u0e0a\\u0e21", "page_views", "view_count", "viewCount"]
+    for js_url, code in all_js_contents.items():
+        for m in re.finditer(r'https?://[^\s"\'`<>\\]+', code):
+            u = m.group(0).rstrip(".,;)]}")
+            if not any(x in u for x in ["w3.org", "reactjs", "vuejs", "mozilla", "google.com/chrome", "reg.chula"]):
+                discovered_urls.add(u)
+
+        for m in re.finditer(r'["\'/`]([0-9A-Za-z_\-/]+\.json)["\'`]', code):
+            discovered_json_names.add(m.group(1).lstrip("/"))
+
+        for kw in view_keywords:
+            idx = code.find(kw)
+            if idx != -1:
+                snippet = code[max(0, idx - 250) : min(len(code), idx + 250)]
+                logger.info(f"🎯 พบโค้ด '{kw}' ใน {js_url.split('/')[-1]}:\n>>> {snippet} <<<")
+
+    logger.info(f"🌐 URL ที่พบใน JS Bundle: {sorted(discovered_urls)}")
+    logger.info(f"📄 ไฟล์ .json ที่พบใน JS Bundle: {sorted(discovered_json_names)}")
+
+    return {
+        "urls": sorted(discovered_urls),
+        "json_names": sorted(discovered_json_names),
+        "js_contents": all_js_contents,
+    }
+
+async def probe_program_endpoints(session: aiohttp.ClientSession, pid: str, discovered_info: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ทดสอบดึงข้อมูลรายสาขา (เช่น 10010133130201A) จาก S3 และ API ที่ค้นพบใน JS Bundle
+    """
+    candidates = [
+        f"{S3_BASE_URL}/programs/{pid}.json",
+        f"{S3_BASE_URL}/courses/{pid}.json",
+        f"{S3_BASE_URL}/rounds/{pid}.json",
+        f"{S3_BASE_URL}/{pid}.json",
+        f"{S3_BASE_URL}/rounds.json",
+        f"{S3_BASE_URL}/views.json",
+        f"{S3_BASE_URL}/stats.json",
+    ]
+    for jname in discovered_info.get("json_names", []):
+        candidates.append(f"{S3_BASE_URL}/{jname}")
+        candidates.append(f"{BASE_URL}/{jname}")
+
+    for u in discovered_info.get("urls", []):
+        if "amazonaws.com" in u or "mytcas" in u:
+            candidates.append(f"{u.rstrip('/')}/{pid}.json")
+            candidates.append(f"{u.rstrip('/')}/programs/{pid}.json")
+            candidates.append(f"{u.rstrip('/')}/programs/{pid}")
+
+    # ตัดรายการซ้ำ
+    unique_candidates = list(dict.fromkeys(candidates))
+    logger.info(f"🧪 กำลังทดสอบยิง Endpoint สำหรับรหัส {pid} จำนวน {len(unique_candidates)} รายการ...")
+
+    found_endpoints = {}
+    for url in unique_candidates:
+        data = await fetch_json(session, url)
+        if data is not None:
+            sample_str = json.dumps(data, ensure_ascii=False)[:350]
+            logger.info(f"✅ [HTTP 200 JSON] พบข้อมูลที่ {url} -> ตัวอย่าง: {sample_str}")
+            found_endpoints[url] = data
+
+    return found_endpoints
+
+def extract_seats_and_views_from_json(obj: Any) -> Dict[str, int]:
+    """แกะจำนวนรับ รอบ 1-4 และยอดผู้เข้าชมจากโครงสร้าง JSON ของสาขา"""
+    r1 = r2 = r3 = r4 = total_seats = views = 0
+
+    if isinstance(obj, dict):
+        # ค้นหายอดวิวจากทุกคีย์ที่เป็นไปได้
+        for k in ["views", "view_count", "viewCount", "page_views", "pageViews", "hits", "count", "total_views", "number_views"]:
+            val = obj.get(k)
+            if isinstance(val, (int, float)) and val > 0:
+                views = int(val)
+                break
+            elif isinstance(val, str) and val.replace(",", "").isdigit():
+                views = int(val.replace(",", ""))
+                break
+
+        # หากมีรายการรอบรับสมัครอยู่ในฟิลด์ย่อย หรือตัวอ็อบเจกต์เอง
+        rounds_list = obj.get("rounds") or obj.get("admission_rounds") or obj.get("quotas") or obj.get("data")
+        if isinstance(rounds_list, list):
+            for r in rounds_list:
+                if not isinstance(r, dict):
+                    continue
+                r_type = str(r.get("type") or r.get("round_type") or r.get("round_id") or r.get("round") or "")
+                seats = int(r.get("receive_student_number") or r.get("receive_seats") or r.get("quota") or r.get("seats") or 0)
+                if r_type.startswith("1") or "portfolio" in r_type.lower():
+                    r1 += seats
+                elif r_type.startswith("2") or "quota" in r_type.lower():
+                    r2 += seats
+                elif r_type.startswith("3") or "admission" in r_type.lower():
+                    r3 += seats
+                elif r_type.startswith("4") or "direct" in r_type.lower():
+                    r4 += seats
+
+    elif isinstance(obj, list):
+        for r in obj:
+            if not isinstance(r, dict):
+                continue
+            r_type = str(r.get("type") or r.get("round_type") or r.get("round_id") or r.get("round") or "")
+            seats = int(r.get("receive_student_number") or r.get("receive_seats") or r.get("quota") or r.get("seats") or 0)
+            if r_type.startswith("1") or "portfolio" in r_type.lower():
+                r1 += seats
+            elif r_type.startswith("2") or "quota" in r_type.lower():
+                r2 += seats
+            elif r_type.startswith("3") or "admission" in r_type.lower():
+                r3 += seats
+            elif r_type.startswith("4") or "direct" in r_type.lower():
+                r4 += seats
+
+            for k in ["views", "view_count", "viewCount", "page_views", "hits"]:
+                if r.get(k) and int(str(r[k]).replace(",", "")) > views:
+                    views = int(str(r[k]).replace(",", ""))
+
     total_seats = r1 + r2 + r3 + r4
+    return {"r1": r1, "r2": r2, "r3": r3, "r4": r4, "total_seats": total_seats, "views": views}
+
+async def main() -> None:
+    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS, ttl_dns_cache=300, ssl=False)
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # 1. สแกน JS Bundle ของเว็บเพื่อค้นหา Endpoint จริง
+        discovered = await inspect_spa_bundles(session)
+        found_test_data = await probe_program_endpoints(session, TEST_PROGRAM_ID, discovered)
+
+        # 2. โหลด S3 Catalog หลัก (universities.json + courses.json)
+        logger.info("🔍 [Stage 1] กำลังดึงฐานข้อมูลหลักสูตรจาก myTCAS S3 Catalog...")
+        uni_json, courses_json = await asyncio.gather(
+            fetch_json(session, S3_UNIVERSITIES_URL),
+            fetch_json(session, S3_COURSES_URL)
+        )
+
+        uni_map = {}
+        if isinstance(uni_json, list):
+            for item in uni_json:
+                uid = extract_val(item, "u_id", "university_id", "id")
+                uname = extract_val(item, "u_name", "university_name", "university_name_th", "name_th")
+                if uid and uname:
+                    uni_map[uid] = uname
+
+        if not isinstance(courses_json, list) or not courses_json:
+            logger.error("❌ ไม่สามารถดึงรายการหลักสูตรจาก S3 ได้")
+            return
+
+        # แสดงตัวอย่างข้อมูลจริงของเภสัชฯ จุฬาฯ (10010133130201A) ใน courses.json
+        for c in courses_json:
+            if extract_val(c, "program_id", "id") == TEST_PROGRAM_ID:
+                logger.info(f"📋 [Debug ข้อมูลจริงใน courses.json ของ {TEST_PROGRAM_ID}]:\n{json.dumps(c, ensure_ascii=False)}")
+                break
+
+        # ตรวจสอบว่ามีไฟล์รวมรอบรับสมัคร (เช่น rounds.json) หรือไฟล์รายสาขาหรือไม่
+        global_rounds_map: Dict[str, List[Dict]] = {}
+        per_program_url_template: Optional[str] = None
+
+        for url, data in found_test_data.items():
+            if url.endswith(f"{TEST_PROGRAM_ID}.json") or url.endswith(f"/{TEST_PROGRAM_ID}"):
+                per_program_url_template = url.replace(TEST_PROGRAM_ID, "{pid}")
+                logger.info(f"🎯 พบ Endpoint รายสาขา: {per_program_url_template}")
+            elif isinstance(data, list) and len(data) > 100 and url != S3_COURSES_URL and url != S3_UNIVERSITIES_URL:
+                for row in data:
+                    if isinstance(row, dict):
+                        p = extract_val(row, "program_id", "id")
+                        if p:
+                            global_rounds_map.setdefault(p, []).append(row)
+
+        catalog = {}
+        for item in courses_json:
+            pid = extract_val(item, "program_id", "id", "code")
+            if len(pid) >= 8:
+                catalog[pid] = item
+
+        total = len(catalog)
+        pids = list(catalog.keys())
+        logger.info(f"🚀 [Stage 2] กำลังประมวลผลข้อมูลจริงทั้ง {total:,} หลักสูตร (ปิดระบบสุ่มตัวเลข 100%)...")
+
+        results = []
+        start_ts = time.time()
+
+        if per_program_url_template:
+            batch_size = 400
+            for idx in range(0, total, batch_size):
+                batch = pids[idx : idx + batch_size]
+                async def fetch_detail(pid: str):
+                    url = per_program_url_template.format(pid=pid)
+                    detail_json = await fetch_json(session, url, semaphore)
+                    return pid, detail_json
+                batch_details = await asyncio.gather(*(fetch_detail(p) for p in batch))
+                for pid, detail_json in batch_details:
+                    raw = catalog[pid]
+                    metrics = extract_seats_and_views_from_json(detail_json) if detail_json else {"r1": 0, "r2": 0, "r3": 0, "r4": 0, "total_seats": 0, "views": 0}
+                    results.append(build_program_record(pid, raw, uni_map, metrics))
+                done = min(idx + batch_size, total)
+                logger.info(f"ความคืบหน้า: {done:,}/{total:,} ({done/total*100:.1f}%)")
+        else:
+            for pid in pids:
+                raw = catalog[pid]
+                rounds_data = global_rounds_map.get(pid, [])
+                metrics = extract_seats_and_views_from_json(rounds_data) if rounds_data else {"r1": 0, "r2": 0, "r3": 0, "r4": 0, "total_seats": 0, "views": 0}
+                results.append(build_program_record(pid, raw, uni_map, metrics))
+
+        # Stage 3: จัดอันดับและบันทึก
+        results.sort(key=lambda x: (x["views"], x["total_seats"]), reverse=True)
+        for i, item in enumerate(results, 1):
+            item["rank"] = i
+
+        now_str = datetime.now(TZ_TH).strftime("%Y-%m-%d %H:%M:%S")
+        total_views = sum(p["views"] for p in results)
+        max_views = results[0]["views"] if results else 0
+        total_seats = sum(p["total_seats"] for p in results)
+
+        payload = {
+            "updated_at": now_str,
+            "last_updated": now_str,
+            "updatedAt": now_str,
+            "timestamp": now_str,
+            "total_programs": len(results),
+            "total_universities": len({p["university"] for p in results if p["university"] != "ไม่ระบุสถาบัน"}),
+            "total_views": total_views,
+            "max_views": max_views,
+            "total_seats": total_seats,
+            "metadata": {
+                "updated_at": now_str,
+                "last_updated": now_str,
+                "total_programs": len(results),
+                "total_universities": len({p["university"] for p in results if p["university"] != "ไม่ระบุสถาบัน"}),
+                "total_views": total_views,
+                "max_views": max_views,
+                "total_seats": total_seats,
+            },
+            "programs": results,
+            "data": results,
+            "courses": results,
+        }
+
+        with OUTPUT_FILE.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+
+        logger.info(f"🎉 เสร็จสิ้น! บันทึก {len(results):,} สาขา | ยอดวิวรวม {total_views:,} ครั้ง | ที่นั่งรวม {total_seats:,} ที่นั่ง")
+
+def build_program_record(pid: str, raw: Dict, uni_map: Dict[str, str], metrics: Dict[str, int]) -> Dict[str, Any]:
+    u_id = extract_val(raw, "university_id", "u_id") or pid[:3]
+    university = extract_val(raw, "university_name_th", "u_name", "university_name") or uni_map.get(u_id, "ไม่ระบุสถาบัน")
+    faculty = extract_val(raw, "faculty_name_th", "faculty_name", "faculty") or "ไม่ระบุคณะ"
+
+    prog_title = extract_val(raw, "program_name_th", "program_name", "name_th")
+    field_title = extract_val(raw, "field_name_th", "field_name", "major_name_th")
+    if field_title and prog_title and field_title not in prog_title:
+        program_name = f"{prog_title} สาขาวิชา{field_title}"
+    else:
+        program_name = prog_title or field_title or f"สาขาวิชา ({pid})"
+
+    # จำนวนรับจาก metrics หรือ fallback จาก major_acceptance_number / number_acceptance_mko2 ใน courses.json
+    total_seats = metrics["total_seats"]
     if total_seats == 0:
-        total_seats = parse_seat("total_seats") or parse_seat("seats") or parse_seat("quota") or parse_seat("receive_student_number")
+        for k in ["major_acceptance_number", "number_acceptance_mko2"]:
+            v = raw.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                total_seats = int(v)
+                break
+            elif isinstance(v, str) and v.replace(",", "").isdigit():
+                total_seats = int(v.replace(",", ""))
+                break
 
-    views = 0
-    if html:
-        for p in VIEW_COUNT_PATTERNS:
-            m = p.search(html)
-            if m:
-                raw_v = m.group(1).replace(",", "").strip()
-                if raw_v.isdigit() and int(raw_v) > 0:
-                    views = int(raw_v)
-                    break
-
-    if views == 0:
-        meta_views = extract_val(raw, "views", "view_count", "hits", "pageviews", "count")
-        if meta_views.isdigit():
-            views = int(meta_views)
-
+    views = metrics["views"]
     category = classify_faculty_group(faculty, program_name)
-    campus = extract_val(raw, "campus_name_th", "campus_name", "campus") or "วิทยาเขตหลัก"
-    program_type = extract_val(raw, "program_type_name_th", "program_type") or "ภาษาไทย ปกติ"
-
-    views_diff = 0
-    prev_v = prev_views_map.get(pid, 0)
-
-    # หากเซิร์ฟเวอร์ myTCAS ไม่ส่งยอดวิว/ที่นั่งมาใน JSON สาธารณะ ให้ใช้ Smart Metrics Engine
-    if ENABLE_SMART_ESTIMATION and (views == 0 or total_seats == 0):
-        est = compute_smart_metrics(pid, category, university, prev_v)
-        if views == 0:
-            views = est["views"]
-            views_diff = est["views_diff"]
-        if total_seats == 0:
-            r1, r2, r3, r4 = est["r1"], est["r2"], est["r3"], est["r4"]
-            total_seats = est["total_seats"]
-    elif prev_v > 0 and views >= prev_v:
-        views_diff = views - prev_v
 
     return {
         "id": pid,
@@ -267,146 +446,19 @@ def parse_program_data(
         "total_seats": total_seats,
         "seats": total_seats,
         "quota": total_seats,
-        "r1": r1,
-        "r2": r2,
-        "r3": r3,
-        "r4": r4,
+        "r1": metrics["r1"],
+        "r2": metrics["r2"],
+        "r3": metrics["r3"],
+        "r4": metrics["r4"],
         "views": views,
         "view_count": views,
         "viewCount": views,
-        "views_diff": views_diff,
+        "views_diff": 0,
         "category": category,
-        "campus": campus,
-        "program_type": program_type,
+        "campus": extract_val(raw, "campus_name_th", "campus_name") or "วิทยาเขตหลัก",
+        "program_type": extract_val(raw, "program_type_name_th", "program_type") or "ภาษาไทย ปกติ",
         "url": f"{BASE_URL}/programs/{pid}",
     }
-
-async def main() -> None:
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS, ttl_dns_cache=300, ssl=False)
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    prev_views_map = load_previous_views_map(OUTPUT_FILE)
-
-    async with aiohttp.ClientSession(connector=connector) as session:
-        logger.info("🔍 [Stage 1] กำลังดึงฐานข้อมูลหลักสูตรจาก myTCAS S3 Catalog...")
-        
-        uni_json, courses_json = await asyncio.gather(
-            fetch_json(session, S3_UNIVERSITIES_URL),
-            fetch_json(session, S3_COURSES_URL)
-        )
-
-        uni_map = {}
-        if isinstance(uni_json, list):
-            for item in uni_json:
-                uid = extract_val(item, "u_id", "university_id", "id")
-                uname = extract_val(item, "u_name", "university_name", "university_name_th", "name_th")
-                if uid and uname:
-                    uni_map[uid] = uname
-
-        if not isinstance(courses_json, list) or len(courses_json) == 0:
-            logger.error("❌ ไม่สามารถดึงรายการหลักสูตรจาก S3 ได้")
-            return
-
-        # แสดงตัวอย่างฟิลด์จริงจาก courses.json ใน Log
-        logger.info(f"📋 [Debug] ฟิลด์ที่มีใน courses.json: {list(courses_json[0].keys())}")
-
-        catalog = {}
-        for item in courses_json:
-            pid = extract_val(item, "program_id", "id", "code")
-            if len(pid) >= 8:
-                catalog[pid] = item
-                uid = extract_val(item, "u_id", "university_id")
-                uname = extract_val(item, "u_name", "university_name", "university_name_th")
-                if uid and uname and uid not in uni_map:
-                    uni_map[uid] = uname
-
-        total = len(catalog)
-        pids = list(catalog.keys())
-        logger.info(f"✅ โหลดสำเร็จ: มหาวิทยาลัย {len(uni_map)} แห่ง | หลักสูตรทั้งหมด {total:,} สาขา")
-
-        # ทดสอบตรวจสอบว่าหน้าเว็บ /programs/{pid} เป็น SPA Shell หรือมีข้อมูลยอดวิวใน HTML
-        is_dynamic_html = False
-        sample_url = f"{BASE_URL}/programs/{pids[0]}"
-        html_sample = await fetch_text(session, sample_url, semaphore)
-        if html_sample:
-            logger.info(f"📡 [Probe Check] ทดสอบอ่าน {sample_url} สำเร็จ (ขนาด {len(html_sample):,} ตัวอักษร)")
-            if any(p.search(html_sample) for p in VIEW_COUNT_PATTERNS):
-                is_dynamic_html = True
-                logger.info("✅ ตรวจพบตัวเลขยอดวิวใน HTML -> เริ่มดึงข้อมูลรายหน้า...")
-            else:
-                logger.info("ℹ️ หน้าเว็บเป็น SPA Shell (ไม่มีตัวเลขยอดวิวใน HTML เปล่า) -> ประมวลผลผ่านฐานข้อมูล S3 และดัชนีความนิยมความเร็วสูง...")
-
-        logger.info(f"🚀 [Stage 2] กำลังประมวลผลข้อมูลทั้ง {total:,} หลักสูตร...")
-        start_ts = time.time()
-        results = []
-
-        if is_dynamic_html:
-            batch_size = 350
-            for idx in range(0, total, batch_size):
-                batch = pids[idx : idx + batch_size]
-                async def process_one(pid):
-                    html = await fetch_text(session, f"{BASE_URL}/programs/{pid}", semaphore)
-                    return parse_program_data(pid, html, catalog[pid], uni_map, prev_views_map)
-                batch_res = await asyncio.gather(*(process_one(p) for p in batch))
-                results.extend(batch_res)
-                done = min(idx + batch_size, total)
-                logger.info(f"ความคืบหน้า: {done:,}/{total:,} ({done/total*100:.1f}%)")
-        else:
-            for pid in pids:
-                results.append(parse_program_data(pid, None, catalog[pid], uni_map, prev_views_map))
-            logger.info(f"ความคืบหน้า: {total:,}/{total:,} (100.0%) | ประมวลผลเสร็จใน {time.time() - start_ts:.2f} วินาที")
-
-        # Stage 3: บันทึกและจัดอันดับ
-        logger.info("📊 [Stage 3] กำลังจัดอันดับและบันทึกไฟล์...")
-        results.sort(key=lambda x: (x["views"], x["total_seats"]), reverse=True)
-
-        for i, item in enumerate(results, 1):
-            item["rank"] = i
-
-        now_th = datetime.now(TZ_TH)
-        now_str = now_th.strftime("%Y-%m-%d %H:%M:%S")
-        max_views = results[0]["views"] if results else 0
-        total_views = sum(p["views"] for p in results)
-        total_seats = sum(p["total_seats"] for p in results)
-
-        payload = {
-            "updated_at": now_str,
-            "last_updated": now_str,
-            "updatedAt": now_str,
-            "timestamp": now_str,
-            "total_programs": len(results),
-            "total_universities": len({p["university"] for p in results if p["university"] != "ไม่ระบุสถาบัน"}),
-            "total_views": total_views,
-            "max_views": max_views,
-            "total_seats": total_seats,
-            "metadata": {
-                "updated_at": now_str,
-                "last_updated": now_str,
-                "updatedAt": now_str,
-                "timestamp": now_str,
-                "total_programs": len(results),
-                "total_universities": len({p["university"] for p in results if p["university"] != "ไม่ระบุสถาบัน"}),
-                "total_views": total_views,
-                "max_views": max_views,
-                "total_seats": total_seats,
-            },
-            "programs": results,
-            "data": results,
-            "courses": results,
-        }
-
-        with OUTPUT_FILE.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
-
-        SPLIT_DIR.mkdir(parents=True, exist_ok=True)
-        by_uni = {}
-        for p in results:
-            by_uni.setdefault(p["university_id"], []).append(p)
-        for uid, rows in by_uni.items():
-            safe_id = re.sub(r"[^0-9A-Za-z_\-]", "_", uid)
-            with (SPLIT_DIR / f"{safe_id}.json").open("w", encoding="utf-8") as f:
-                json.dump(rows, f, ensure_ascii=False, separators=(",", ":"))
-
-        logger.info(f"🎉 เสร็จสิ้น! บันทึก {len(results):,} สาขา | ยอดวิวรวม {total_views:,} ครั้ง ลง data.json เรียบร้อย")
 
 if __name__ == "__main__":
     asyncio.run(main())
